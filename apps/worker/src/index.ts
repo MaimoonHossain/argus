@@ -1,20 +1,26 @@
 // apps/worker/src/index.ts
-import express from 'express';
+import { httpServer, io } from './socket';
 import { researchWorker } from './queues';
 
-const app = express();
+io.on('connection', (socket) => {
+    console.log(`[Socket] Frontend UI connected: ${socket.id}`);
 
-// The throwaway route that keeps Render's free Web Service tier happy
-app.get('/health', (_req, res) => res.sendStatus(200));
+    socket.on('disconnect', () => {
+        console.log(`[Socket] Frontend UI disconnected: ${socket.id}`);
+    });
+});
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+
+httpServer.listen(PORT, () => {
     console.log(`Argus Worker is alive on port ${PORT}`);
-    console.log(`Listening for jobs on 'research-pipeline' queue...`);
+    console.log(`Listening for WebSockets, HTTP /health, and BullMQ jobs...`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
+    console.log('SIGTERM received. Cleaning up worker and sockets...');
     await researchWorker.close();
+    httpServer.close();
     process.exit(0);
 });
