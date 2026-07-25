@@ -1,0 +1,14 @@
+{
+  "name": "@argus/db",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "types": "index.ts",
+  "dependencies": {
+    "drizzle-orm": "^0.31.0",
+    "@neondatabase/serverless": "^0.9.3"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.22.0",
+    "typescript": "^5.0.0"
+  }
+}

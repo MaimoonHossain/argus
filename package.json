@@ -1,0 +1,8 @@
+{
+  "name": "argus-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
