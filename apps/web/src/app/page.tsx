@@ -9,6 +9,7 @@ type JobResult = {
   status: 'pending' | 'researching' | 'synthesizing' | 'complete' | 'failed';
   finalAnswer?: string | null;
   errorMessage?: string | null;
+  sources?: { title: string; url: string }[]; // <-- Add this line
 };
 
 // Initialize socket instance targeting the worker port
@@ -47,6 +48,22 @@ export default function Home() {
             return {
               ...prev,
               finalAnswer: (prev.finalAnswer || '') + data.chunk
+            };
+          });
+        }
+        return currentJobId;
+      });
+    });
+
+    // Listen for incoming source citations
+    socket.on('job-sources', (data: { id: string, sources: { title: string, url: string }[] }) => {
+      setJobId((currentJobId) => {
+        if (data.id === currentJobId) {
+          setJob((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              sources: data.sources
             };
           });
         }
@@ -135,6 +152,24 @@ export default function Home() {
               {job.status}
             </span>
           </div>
+
+          {job.sources && job.sources.length > 0 && (
+            <div className="mt-4 flex flex-wrap gap-2 items-center">
+              <span className="text-sm font-semibold text-gray-600">Sources:</span>
+              {job.sources.map((source, idx) => (
+                <a
+                  key={idx}
+                  href={source.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1 bg-gray-200 hover:bg-gray-300 text-blue-700 text-xs rounded-full transition-colors truncate max-w-[250px]"
+                  title={source.title}
+                >
+                  {source.title}
+                </a>
+              ))}
+            </div>
+          )}
 
           {job.status === 'failed' && (
             <div className="text-red-700 bg-red-100 p-4 rounded-md border border-red-200">

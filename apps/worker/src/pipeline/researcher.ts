@@ -13,12 +13,18 @@ const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY! });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
 // 1. Define the Global State (Our AI's memory)
+
 const AgentState = Annotation.Root({
     jobId: Annotation<string>(),
     question: Annotation<string>(),
     localContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     webContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     finalAnswer: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
+    // Add a new annotation to hold our source links
+    sources: Annotation<{ title: string; url: string }[]>({
+        reducer: (state, update) => state.concat(update),
+        default: () => []
+    }),
 });
 
 // 2. Node: Search Neon pgvector
@@ -59,10 +65,23 @@ async function searchLiveWeb(state: typeof AgentState.State) {
         });
 
         const webInfo = response.results.map((r: any) => `Source: ${r.title}\n${r.content}`).join('\n\n');
-        return { webContext: webInfo };
+
+        // Map out the clean URLs and Titles
+        const webSources = response.results.map((r: any) => ({
+            title: r.title,
+            url: r.url
+        }));
+
+        // Instantly blast the sources to the UI before synthesis even starts
+        io.emit('job-sources', {
+            id: state.jobId,
+            sources: webSources
+        });
+
+        return { webContext: webInfo, sources: webSources };
     } catch (error) {
         console.error("Tavily error:", error);
-        return { webContext: "Web search failed or unavailable." };
+        return { webContext: "Web search failed or unavailable.", sources: [] };
     }
 }
 
