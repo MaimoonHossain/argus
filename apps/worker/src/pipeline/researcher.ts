@@ -91,19 +91,34 @@ async function synthesize(state: typeof AgentState.State) {
   
   QUESTION: ${state.question}`;
 
-    const response = await ai.models.generateContent({
+    // Use generateContentStream instead of generateContent
+    const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3-flash-preview',
         contents: prompt,
     });
 
-    const finalAnswer = response.text || "Failed to generate an answer.";
+    let fullAnswer = "";
+
+    // Iterate through the stream and emit each chunk over WebSockets instantly
+    for await (const chunk of responseStream) {
+        if (chunk.text) {
+            fullAnswer += chunk.text;
+
+            io.emit('job-stream', {
+                id: state.jobId,
+                chunk: chunk.text
+            });
+        }
+    }
+
+    const finalAnswer = fullAnswer || "Failed to generate an answer.";
 
     // Update Database with complete status and final payload
     await db.update(researchJobs)
         .set({ status: 'complete', finalAnswer })
         .where(eq(researchJobs.id, state.jobId));
 
-    // Broadcast completion event with the generated answer
+    // Broadcast completion event
     io.emit('job-update', {
         id: state.jobId,
         status: 'complete',
