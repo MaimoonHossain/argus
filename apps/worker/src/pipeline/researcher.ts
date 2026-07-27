@@ -8,43 +8,56 @@ import { tavily } from '@tavily/core';
 import { Job } from 'bullmq';
 import { io } from '../socket';
 
-// Initialize external clients
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY! });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
-// 1. Define the Global State (Our AI's memory)
-
+// 1. Add routeDecision to State
 const AgentState = Annotation.Root({
     jobId: Annotation<string>(),
     question: Annotation<string>(),
     localContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     webContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     finalAnswer: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
-    // Add a new annotation to hold our source links
     sources: Annotation<{ title: string; url: string }[]>({
         reducer: (state, update) => state.concat(update),
         default: () => []
     }),
+    routeDecision: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "both" }),
 });
 
-// 2. Node: Search Neon pgvector
-async function retrieveLocal(state: typeof AgentState.State) {
-    console.log(`[Node] Searching Postgres for: "${state.question}"`);
+// 2. NEW NODE: The Router
+async function router(state: typeof AgentState.State) {
+    console.log(`[Node] Routing question: "${state.question}"`);
 
-    // Update Database
-    await db.update(researchJobs)
-        .set({ status: 'researching' })
-        .where(eq(researchJobs.id, state.jobId));
+    // Set initial status so the UI knows we are active
+    io.emit('job-update', { id: state.jobId, status: 'researching' });
 
-    // Broadcast real-time event to connected UI clients
-    io.emit('job-update', {
-        id: state.jobId,
-        status: 'researching'
+    const prompt = `You are a routing agent. Analyze this question: "${state.question}"
+  Decide the best data retrieval path.
+  Options:
+  - "both": Needs internal/local knowledge AND recent live web data.
+  - "local": ONLY needs internal/local knowledge base.
+  - "web": ONLY needs current events, real-time data, or live internet searches.
+  - "direct": General greetings (e.g. "hi") or basic knowledge that requires NO search.
+  Respond with exactly ONE of those four words and nothing else.`;
+
+    const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+        config: { temperature: 0 } // Keep it deterministic
     });
 
+    const decision = response.text?.trim().toLowerCase() || "both";
+    console.log(`[Router] Decision made: ${decision}`);
+
+    return { routeDecision: decision };
+}
+
+// 3. Node: Search Neon pgvector
+async function retrieveLocal(state: typeof AgentState.State) {
+    console.log(`[Node] Executing Local Vector Search...`);
     const embedding = await embedQuestion(state.question);
 
-    // Use pgvector distance operator directly in orderBy for index acceleration
     const results = await db.select()
         .from(knowledgeChunks)
         .orderBy(sql`${knowledgeChunks.embedding} <=> ${JSON.stringify(embedding)}`)
@@ -54,143 +67,100 @@ async function retrieveLocal(state: typeof AgentState.State) {
     return { localContext: context };
 }
 
-// 3. Node: Search Tavily (Live Web)
+// 4. Node: Search Tavily
 async function searchLiveWeb(state: typeof AgentState.State) {
-    console.log(`[Node] Hitting Tavily Web Search...`);
-
+    console.log(`[Node] Executing Live Web Search...`);
     try {
-        const response = await tvly.search(state.question, {
-            searchDepth: "basic",
-            maxResults: 3,
-        });
-
+        const response = await tvly.search(state.question, { searchDepth: "basic", maxResults: 3 });
         const webInfo = response.results.map((r: any) => `Source: ${r.title}\n${r.content}`).join('\n\n');
 
-        // Map out the clean URLs and Titles
         const webSources = response.results.map((r: any) => ({
             title: r.title,
             url: r.url
         }));
 
-        // Instantly blast the sources to the UI before synthesis even starts
-        io.emit('job-sources', {
-            id: state.jobId,
-            sources: webSources
-        });
-
+        io.emit('job-sources', { id: state.jobId, sources: webSources });
         return { webContext: webInfo, sources: webSources };
     } catch (error) {
         console.error("Tavily error:", error);
-        return { webContext: "Web search failed or unavailable.", sources: [] };
+        return { webContext: "Web search failed.", sources: [] };
     }
 }
 
-// 4. Node: Gemini Synthesis
+// 5. Node: Gemini Synthesis
 async function synthesize(state: typeof AgentState.State) {
     console.log(`[Node] Synthesizing final answer...`);
 
-    // Update Database
-    await db.update(researchJobs)
-        .set({ status: 'synthesizing' })
-        .where(eq(researchJobs.id, state.jobId));
+    await db.update(researchJobs).set({ status: 'synthesizing' }).where(eq(researchJobs.id, state.jobId));
+    io.emit('job-update', { id: state.jobId, status: 'synthesizing' });
 
-    // Broadcast real-time event
-    io.emit('job-update', {
-        id: state.jobId,
-        status: 'synthesizing'
-    });
-
-    const prompt = `You are an expert research assistant. Answer the user's question using the provided context. 
-  
-  LOCAL DATABASE CONTEXT:
-  ${state.localContext}
-  
-  LIVE WEB CONTEXT:
-  ${state.webContext}
-  
+    const prompt = `You are an expert research assistant. Answer the user's question.
+  LOCAL CONTEXT: ${state.localContext}
+  WEB CONTEXT: ${state.webContext}
   QUESTION: ${state.question}`;
 
-    // Use generateContentStream instead of generateContent
     const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3-flash-preview',
         contents: prompt,
     });
 
     let fullAnswer = "";
-
-    // Iterate through the stream and emit each chunk over WebSockets instantly
     for await (const chunk of responseStream) {
         if (chunk.text) {
             fullAnswer += chunk.text;
-
-            io.emit('job-stream', {
-                id: state.jobId,
-                chunk: chunk.text
-            });
+            io.emit('job-stream', { id: state.jobId, chunk: chunk.text });
         }
     }
 
     const finalAnswer = fullAnswer || "Failed to generate an answer.";
 
-    // Update Database with complete status and final payload
-    await db.update(researchJobs)
-        .set({ status: 'complete', finalAnswer })
-        .where(eq(researchJobs.id, state.jobId));
-
-    // Broadcast completion event
-    io.emit('job-update', {
-        id: state.jobId,
-        status: 'complete',
-        finalAnswer
-    });
+    await db.update(researchJobs).set({ status: 'complete', finalAnswer }).where(eq(researchJobs.id, state.jobId));
+    io.emit('job-update', { id: state.jobId, status: 'complete', finalAnswer });
 
     return { finalAnswer };
 }
 
-// 5. Compile the Graph
+// 6. Compile the Agentic Graph
 const workflow = new StateGraph(AgentState)
+    .addNode("router", router)
     .addNode("retrieveLocal", retrieveLocal)
     .addNode("searchLiveWeb", searchLiveWeb)
     .addNode("synthesize", synthesize)
-    .addEdge(START, "retrieveLocal")
-    .addEdge("retrieveLocal", "searchLiveWeb")
+
+    // Start at the router
+    .addEdge(START, "router")
+
+    // Conditional Edge: Where does the router send us?
+    .addConditionalEdges("router", (state) => {
+        if (state.routeDecision === "local" || state.routeDecision === "both") return "retrieveLocal";
+        if (state.routeDecision === "web") return "searchLiveWeb";
+        return "synthesize"; // "direct" route
+    })
+
+    // Conditional Edge: If we went local, do we also need web?
+    .addConditionalEdges("retrieveLocal", (state) => {
+        if (state.routeDecision === "both") return "searchLiveWeb";
+        return "synthesize";
+    })
+
+    // If we hit the web, always synthesize next
     .addEdge("searchLiveWeb", "synthesize")
     .addEdge("synthesize", END);
 
 const app = workflow.compile();
 
-// 6. The BullMQ Entrypoint
+// 7. BullMQ Entrypoint
 export async function processResearchJob(job: Job) {
     const { jobId } = job.data;
-
-    const jobRecord = await db.query.researchJobs.findFirst({
-        where: eq(researchJobs.id, jobId)
-    });
-
+    const jobRecord = await db.query.researchJobs.findFirst({ where: eq(researchJobs.id, jobId) });
     if (!jobRecord) throw new Error("Job not found");
 
     try {
-        // Kick off the LangGraph execution
-        await app.invoke({
-            jobId: jobRecord.id,
-            question: jobRecord.question,
-        });
+        await app.invoke({ jobId: jobRecord.id, question: jobRecord.question });
     } catch (error: any) {
-        const errorMessage = error?.message || "An unexpected error occurred during research.";
         console.error(`[Worker Error] Job ${jobId} failed:`, error);
-
-        // Persist failure state to Database
-        await db.update(researchJobs)
-            .set({ status: 'failed', errorMessage })
-            .where(eq(researchJobs.id, jobId));
-
-        // Broadcast failure event
-        io.emit('job-update', {
-            id: jobId,
-            status: 'failed',
-            errorMessage
-        });
-
+        await db.update(researchJobs).set({ status: 'failed', errorMessage: error.message }).where(eq(researchJobs.id, jobId));
+        io.emit('job-update', { id: jobId, status: 'failed', errorMessage: error.message });
         throw error;
     }
 }

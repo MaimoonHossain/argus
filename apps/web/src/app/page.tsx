@@ -148,6 +148,8 @@ export default function Home() {
                   ? 'bg-red-200 text-red-800'
                   : 'bg-blue-200 text-blue-800 animate-pulse'
                 }`}
+
+
             >
               {job.status}
             </span>
