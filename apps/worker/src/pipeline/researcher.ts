@@ -1,5 +1,5 @@
 // apps/worker/src/pipeline/researcher.ts
-import { StateGraph, START, END, Annotation } from '@langchain/langgraph';
+import { StateGraph, START, END, Annotation, MemorySaver } from '@langchain/langgraph';
 import { db, researchJobs, knowledgeChunks } from '@argus/db';
 import { eq, sql } from 'drizzle-orm';
 import { embedQuestion } from '../llm/gemini';
@@ -7,14 +7,26 @@ import { GoogleGenAI } from '@google/genai';
 import { tavily } from '@tavily/core';
 import { Job } from 'bullmq';
 import { io } from '../socket';
+import { AIMessage, BaseMessage, HumanMessage } from '@langchain/core/messages';
 
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY! });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 
-// 1. Add routeDecision to State
+// 1. Add routeDecision to States
 const AgentState = Annotation.Root({
     jobId: Annotation<string>(),
     question: Annotation<string>(),
+
+    messages: Annotation<BaseMessage[]>({
+        reducer: (state, update) => {
+            // Append the new messages
+            const newMessages = state.concat(update);
+            // Slice it to keep only the last 4 messages (2 User, 2 AI)
+            return newMessages.slice(-4);
+        },
+        default: () => []
+    }),
+
     localContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     webContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     finalAnswer: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
@@ -28,12 +40,21 @@ const AgentState = Annotation.Root({
 // 2. NEW NODE: The Router
 async function router(state: typeof AgentState.State) {
     console.log(`[Node] Routing question: "${state.question}"`);
-
-    // Set initial status so the UI knows we are active
     io.emit('job-update', { id: state.jobId, status: 'researching' });
 
-    const prompt = `You are a routing agent. Analyze this question: "${state.question}"
-  Decide the best data retrieval path.
+    // Format the past conversation history for the LLM
+    const historyText = state.messages
+        .map(m => `${m instanceof HumanMessage ? 'User' : 'Assistant'}: ${m.content}`)
+        .join('\n');
+
+    const prompt = `You are a routing agent. 
+  
+  PAST CONVERSATION:
+  ${historyText || "No previous conversation."}
+
+  CURRENT QUESTION: "${state.question}"
+
+  Decide the best data retrieval path for the CURRENT QUESTION based on the context.
   Options:
   - "both": Needs internal/local knowledge AND recent live web data.
   - "local": ONLY needs internal/local knowledge base.
@@ -44,12 +65,13 @@ async function router(state: typeof AgentState.State) {
     const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: prompt,
-        config: { temperature: 0 } // Keep it deterministic
+        config: { temperature: 0 }
     });
 
     const decision = response.text?.trim().toLowerCase() || "both";
     console.log(`[Router] Decision made: ${decision}`);
 
+    // We don't push the HumanMessage here, we do it at the start of the graph invocation
     return { routeDecision: decision };
 }
 
@@ -94,10 +116,20 @@ async function synthesize(state: typeof AgentState.State) {
     await db.update(researchJobs).set({ status: 'synthesizing' }).where(eq(researchJobs.id, state.jobId));
     io.emit('job-update', { id: state.jobId, status: 'synthesizing' });
 
-    const prompt = `You are an expert research assistant. Answer the user's question.
-  LOCAL CONTEXT: ${state.localContext}
-  WEB CONTEXT: ${state.webContext}
-  QUESTION: ${state.question}`;
+    // Format history for context
+    const historyText = state.messages
+        .map(m => `${m instanceof HumanMessage ? 'User' : 'Assistant'}: ${m.content}`)
+        .join('\n');
+
+    const prompt = `You are an expert research assistant. Answer the user's current question using the context below.
+
+    PAST CONVERSATION (for context):
+    ${historyText || "No previous conversation."}
+
+    LOCAL CONTEXT: ${state.localContext}
+    WEB CONTEXT: ${state.webContext}
+    
+    CURRENT QUESTION: ${state.question}`;
 
     const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3-flash-preview',
@@ -117,8 +149,15 @@ async function synthesize(state: typeof AgentState.State) {
     await db.update(researchJobs).set({ status: 'complete', finalAnswer }).where(eq(researchJobs.id, state.jobId));
     io.emit('job-update', { id: state.jobId, status: 'complete', finalAnswer });
 
-    return { finalAnswer };
+    // Append the AI's response to the messages array
+    return {
+        finalAnswer,
+        messages: [new AIMessage(finalAnswer)]
+    };
 }
+
+// Initialize the checkpointer
+const checkpointer = new MemorySaver();
 
 // 6. Compile the Agentic Graph
 const workflow = new StateGraph(AgentState)
@@ -147,16 +186,19 @@ const workflow = new StateGraph(AgentState)
     .addEdge("searchLiveWeb", "synthesize")
     .addEdge("synthesize", END);
 
-const app = workflow.compile();
+const app = workflow.compile({ checkpointer });
 
 // 7. BullMQ Entrypoint
 export async function processResearchJob(job: Job) {
-    const { jobId } = job.data;
+    const { jobId, threadId } = job.data;
     const jobRecord = await db.query.researchJobs.findFirst({ where: eq(researchJobs.id, jobId) });
     if (!jobRecord) throw new Error("Job not found");
 
+    // We use a hardcoded thread string if one isn't provided yet
+    const config = { configurable: { thread_id: threadId || "default-session" } };
+
     try {
-        await app.invoke({ jobId: jobRecord.id, question: jobRecord.question });
+        await app.invoke({ jobId: jobRecord.id, question: jobRecord.question, messages: [new HumanMessage(jobRecord.question)] }, config);
     } catch (error: any) {
         console.error(`[Worker Error] Job ${jobId} failed:`, error);
         await db.update(researchJobs).set({ status: 'failed', errorMessage: error.message }).where(eq(researchJobs.id, jobId));
