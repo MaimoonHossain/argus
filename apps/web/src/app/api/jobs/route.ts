@@ -3,10 +3,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db, researchJobs } from '@argus/db';
 import { researchQueue } from '@/lib/queue';
 import { eq, and } from 'drizzle-orm';
+import { threadId } from 'worker_threads';
 
 export async function POST(req: NextRequest) {
     try {
-        const { question } = await req.json();
+        const { question, sessionId } = await req.json();
 
         if (!question || question.length < 10 || question.length > 500) {
             return NextResponse.json({ error: 'Question must be between 10 and 500 characters.' }, { status: 400 });
@@ -36,7 +37,7 @@ export async function POST(req: NextRequest) {
             status: 'pending'
         }).returning({ id: researchJobs.id });
 
-        await researchQueue.add('research', { jobId: newJob.id });
+        await researchQueue.add('research', { jobId: newJob.id, threadId: sessionId || 'default-session' });
 
         return NextResponse.json({ jobId: newJob.id, cached: false }, { status: 201 });
     } catch (error) {

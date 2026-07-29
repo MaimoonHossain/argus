@@ -20,6 +20,10 @@ export default function Home() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [job, setJob] = useState<JobResult | null>(null);
 
+  const [sessionId] = useState(() =>
+    typeof window !== 'undefined' ? crypto.randomUUID() : 'ssr-session'
+  );
+
   useEffect(() => {
     socket = io(`${process.env.NEXT_PUBLIC_SOCKET_URL}`);
 
@@ -86,7 +90,7 @@ export default function Home() {
       const res = await fetch('/api/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, sessionId }),
       });
 
       if (!res.ok) {

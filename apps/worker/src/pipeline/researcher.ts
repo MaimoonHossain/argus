@@ -37,44 +37,66 @@ const AgentState = Annotation.Root({
     routeDecision: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "both" }),
 });
 
-// 2. NEW NODE: The Router
+// 2. NEW NODE: The Router + Query Rewriter
 async function router(state: typeof AgentState.State) {
-    console.log(`[Node] Routing question: "${state.question}"`);
+    console.log(`[Node] Routing & Contextualizing question: "${state.question}"`);
     io.emit('job-update', { id: state.jobId, status: 'researching' });
 
-    // Format the past conversation history for the LLM
+    // Format past conversation history
     const historyText = state.messages
+        .slice(0, -1) // Exclude the current message that was just added
         .map(m => `${m instanceof HumanMessage ? 'User' : 'Assistant'}: ${m.content}`)
         .join('\n');
 
-    const prompt = `You are a routing agent. 
-  
-  PAST CONVERSATION:
+    const prompt = `You are an intelligent routing and query-rewriting agent.
+
+  PAST CONVERSATION HISTORY:
   ${historyText || "No previous conversation."}
 
-  CURRENT QUESTION: "${state.question}"
+  CURRENT USER QUESTION: "${state.question}"
 
-  Decide the best data retrieval path for the CURRENT QUESTION based on the context.
+  TASK 1 (Query Rewriting): If the CURRENT USER QUESTION uses pronouns or implicit references (like "he", "his", "it", "that", "there"), rewrite it into a clear, standalone search query using context from PAST CONVERSATION HISTORY. If it is already standalone, leave it unchanged.
+
+  TASK 2 (Routing): Decide the best data retrieval path for the rewritten question.
   Options:
   - "both": Needs internal/local knowledge AND recent live web data.
   - "local": ONLY needs internal/local knowledge base.
   - "web": ONLY needs current events, real-time data, or live internet searches.
   - "direct": General greetings (e.g. "hi") or basic knowledge that requires NO search.
-  Respond with exactly ONE of those four words and nothing else.`;
+
+  Respond strictly in JSON format like this:
+  {
+    "rewrittenQuestion": "the standalone question here",
+    "routeDecision": "both" | "local" | "web" | "direct"
+  }`;
 
     const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: prompt,
-        config: { temperature: 0 }
+        config: {
+            temperature: 0,
+            responseMimeType: "application/json" // Force strict JSON output
+        }
     });
 
-    const decision = response.text?.trim().toLowerCase() || "both";
-    console.log(`[Router] Decision made: ${decision}`);
+    try {
+        const result = JSON.parse(response.text || "{}");
+        const decision = result.routeDecision || "both";
+        const rewrittenQuestion = result.rewrittenQuestion || state.question;
 
-    // We don't push the HumanMessage here, we do it at the start of the graph invocation
-    return { routeDecision: decision };
+        console.log(`[Router] Rewritten Question: "${rewrittenQuestion}"`);
+        console.log(`[Router] Decision made: ${decision}`);
+
+        // Returning both updates state.question AND state.routeDecision!
+        return {
+            question: rewrittenQuestion,
+            routeDecision: decision
+        };
+    } catch (err) {
+        console.error("[Router] JSON Parse failed, falling back", err);
+        return { routeDecision: "both" };
+    }
 }
-
 // 3. Node: Search Neon pgvector
 async function retrieveLocal(state: typeof AgentState.State) {
     console.log(`[Node] Executing Local Vector Search...`);
