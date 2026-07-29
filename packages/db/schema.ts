@@ -8,6 +8,7 @@ import {
   jsonb,
   vector,
   index,
+  varchar,
 } from "drizzle-orm/pg-core";
 
 export const jobStatusEnum = pgEnum("job_status", [
@@ -50,6 +51,7 @@ export const knowledgeChunks = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     content: text("content").notNull(),
     embedding: vector("embedding", { dimensions: 768 }),
+    sessionId: varchar('session_id', { length: 255 }).notNull().default('global'),
     sourceUrl: text("source_url"),
     sourceType: sourceTypeEnum("source_type")
       .notNull()
@@ -57,12 +59,12 @@ export const knowledgeChunks = pgTable(
     researchJobId: uuid("research_job_id").references(() => researchJobs.id),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
-  (t) => [
-    index("knowledge_chunks_embedding_idx").using(
+  (t) => ({
+    knowledgeChunksEmbeddingIdx: index("knowledge_chunks_embedding_idx").using(
       "hnsw",
       t.embedding.op("vector_cosine_ops"),
     ),
-  ],
+  }),
 );
 
 export const subQuestions = pgTable(
@@ -79,5 +81,7 @@ export const subQuestions = pgTable(
     createdAt: timestamp("created_at").notNull().defaultNow(),
     completedAt: timestamp("completed_at"),
   },
-  (t) => [index("sub_questions_job_idx").on(t.researchJobId)],
+  (t) => ({
+    subQuestionsJobIdx: index("sub_questions_job_idx").on(t.researchJobId),
+  }),
 );

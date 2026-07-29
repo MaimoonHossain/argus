@@ -1,7 +1,7 @@
 // apps/worker/src/pipeline/researcher.ts
 import { StateGraph, START, END, Annotation, MemorySaver } from '@langchain/langgraph';
 import { db, researchJobs, knowledgeChunks } from '@argus/db';
-import { eq, sql } from 'drizzle-orm';
+import { eq, or, sql } from 'drizzle-orm';
 import { embedQuestion } from '../llm/gemini';
 import { GoogleGenAI } from '@google/genai';
 import { tavily } from '@tavily/core';
@@ -15,6 +15,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
 // 1. Add routeDecision to States
 const AgentState = Annotation.Root({
     jobId: Annotation<string>(),
+    sessionId: Annotation<string>(),
     question: Annotation<string>(),
 
     messages: Annotation<BaseMessage[]>({
@@ -42,33 +43,63 @@ async function router(state: typeof AgentState.State) {
     console.log(`[Node] Routing & Contextualizing question: "${state.question}"`);
     io.emit('job-update', { id: state.jobId, status: 'researching' });
 
-    // Format past conversation history
+    // 1. Format past conversation history
     const historyText = state.messages
         .slice(0, -1) // Exclude the current message that was just added
         .map(m => `${m instanceof HumanMessage ? 'User' : 'Assistant'}: ${m.content}`)
         .join('\n');
 
+    // 2. Fetch Uploaded Document Context
+    // We fetch distinct document names associated with this session to give the router hints.
+    const uploadedDocs = await db
+        .select({ source: sql<string>`split_part(content, '\n\n', 1)` }) // Grabs the [Source: filename] tag
+        .from(knowledgeChunks)
+        .where(eq(knowledgeChunks.sessionId, state.sessionId))
+        .groupBy(sql`split_part(content, '\n\n', 1)`);
+
+    const docNames = uploadedDocs.map(d => d.source.replace('[Source: ', '').replace(']', '')).join(', ');
+
+    // --- NEW: THE HARD OVERRIDE ---
+    // If the user asks about something that directly matches a document name, 
+    // bypass the LLM's routing logic and force it to check local first.
+    const questionLower = state.question.toLowerCase();
+    const isDirectMatch = uploadedDocs.some(doc => {
+        const cleanName = doc.source.replace('[Source: ', '').replace('.pdf', '').replace('.txt', '').replace(']', '').toLowerCase();
+        // Check if any significant word from the filename is in the question
+        return cleanName.split(' ').some(word => word.length > 3 && questionLower.includes(word));
+    });
+
+    let forcedRoute = null;
+    if (isDirectMatch) {
+        console.log(`[Router] ⚠️ Direct match found with uploaded document. Forcing local route.`);
+        forcedRoute = "local";
+    }
+
+    // 3. The Optimized Prompt
     const prompt = `You are an intelligent routing and query-rewriting agent.
 
-  PAST CONVERSATION HISTORY:
-  ${historyText || "No previous conversation."}
+    PAST CONVERSATION HISTORY:
+    ${historyText || "No previous conversation."}
 
-  CURRENT USER QUESTION: "${state.question}"
+    UPLOADED LOCAL DOCUMENTS FOR THIS USER: 
+    ${docNames || "None"}
 
-  TASK 1 (Query Rewriting): If the CURRENT USER QUESTION uses pronouns or implicit references (like "he", "his", "it", "that", "there"), rewrite it into a clear, standalone search query using context from PAST CONVERSATION HISTORY. If it is already standalone, leave it unchanged.
+    CURRENT USER QUESTION: "${state.question}"
 
-  TASK 2 (Routing): Decide the best data retrieval path for the rewritten question.
-  Options:
-  - "both": Needs internal/local knowledge AND recent live web data.
-  - "local": ONLY needs internal/local knowledge base.
-  - "web": ONLY needs current events, real-time data, or live internet searches.
-  - "direct": General greetings (e.g. "hi") or basic knowledge that requires NO search.
+    TASK 1 (Query Rewriting): If the CURRENT USER QUESTION uses pronouns or implicit references, rewrite it into a clear, standalone search query using context from PAST CONVERSATION HISTORY. If it is already standalone, leave it unchanged.
 
-  Respond strictly in JSON format like this:
-  {
-    "rewrittenQuestion": "the standalone question here",
-    "routeDecision": "both" | "local" | "web" | "direct"
-  }`;
+    TASK 2 (Routing): Decide the best data retrieval path.
+    Options:
+    - "local": USE THIS FIRST if the question relates in any way to the subjects covered in the UPLOADED LOCAL DOCUMENTS. 
+    - "web": Use this ONLY for current events, news, or topics clearly NOT covered in the local documents.
+    - "both": Use this ONLY if the question explicitly demands comparing local documents against live internet data.
+    - "direct": General greetings (e.g. "hi") that require NO search.
+
+    Respond strictly in JSON format like this:
+    {
+        "rewrittenQuestion": "the standalone question here",
+        "routeDecision": "both" | "local" | "web" | "direct"
+    }`;
 
     const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
@@ -81,7 +112,7 @@ async function router(state: typeof AgentState.State) {
 
     try {
         const result = JSON.parse(response.text || "{}");
-        const decision = result.routeDecision || "both";
+        const decision = forcedRoute || result.routeDecision || "local";
         const rewrittenQuestion = result.rewrittenQuestion || state.question;
 
         console.log(`[Router] Rewritten Question: "${rewrittenQuestion}"`);
@@ -94,7 +125,10 @@ async function router(state: typeof AgentState.State) {
         };
     } catch (err) {
         console.error("[Router] JSON Parse failed, falling back", err);
-        return { routeDecision: "both" };
+        return { 
+            question: state.question,
+            routeDecision: forcedRoute || "local" 
+        };
     }
 }
 // 3. Node: Search Neon pgvector
@@ -104,6 +138,12 @@ async function retrieveLocal(state: typeof AgentState.State) {
 
     const results = await db.select()
         .from(knowledgeChunks)
+        .where(
+            or(
+                eq(knowledgeChunks.sessionId, state.sessionId),
+                eq(knowledgeChunks.sessionId, 'global') // Fallback for pre-seeded data
+            )
+        )
         .orderBy(sql`${knowledgeChunks.embedding} <=> ${JSON.stringify(embedding)}`)
         .limit(3);
 
@@ -220,7 +260,12 @@ export async function processResearchJob(job: Job) {
     const config = { configurable: { thread_id: threadId || "default-session" } };
 
     try {
-        await app.invoke({ jobId: jobRecord.id, question: jobRecord.question, messages: [new HumanMessage(jobRecord.question)] }, config);
+        await app.invoke({
+            jobId: jobRecord.id,
+            sessionId: threadId || "default-session",
+            question: jobRecord.question,
+            messages: [new HumanMessage(jobRecord.question)]
+        }, config);
     } catch (error: any) {
         console.error(`[Worker Error] Job ${jobId} failed:`, error);
         await db.update(researchJobs).set({ status: 'failed', errorMessage: error.message }).where(eq(researchJobs.id, jobId));

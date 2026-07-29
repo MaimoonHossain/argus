@@ -2,6 +2,7 @@
 import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { processResearchJob } from './pipeline/researcher';
+import { processIngestJob } from './pipeline/ingester';
 
 if (!process.env.REDIS_URL) throw new Error('REDIS_URL is required');
 
@@ -19,3 +20,6 @@ export const researchWorker = new Worker('research-pipeline', processResearchJob
     stalledInterval: 300000, // Check for stalled jobs every 5 mins (reduces idle polling)
     lockDuration: 60000,
 });
+
+// NEW: Ingestion worker
+export const ingestWorker = new Worker('ingest-pipeline', processIngestJob, { connection });

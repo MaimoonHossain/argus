@@ -19,10 +19,19 @@ export default function Home() {
   const [question, setQuestion] = useState('');
   const [jobId, setJobId] = useState<string | null>(null);
   const [job, setJob] = useState<JobResult | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
 
-  const [sessionId] = useState(() =>
-    typeof window !== 'undefined' ? crypto.randomUUID() : 'ssr-session'
-  );
+  const [sessionId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      let saved = localStorage.getItem('argus_session_id');
+      if (!saved) {
+        saved = crypto.randomUUID();
+        localStorage.setItem('argus_session_id', saved);
+      }
+      return saved;
+    }
+    return 'ssr-session';
+  });
 
   useEffect(() => {
     socket = io(`${process.env.NEXT_PUBLIC_SOCKET_URL}`);
@@ -80,6 +89,26 @@ export default function Home() {
     };
   }, []);
 
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('sessionId', sessionId); // Attach the current user's session
+
+    try {
+      await fetch('/api/ingest', { method: 'POST', body: formData });
+      alert(`"${file.name}" sent to backend for processing! You can ask questions about it in a few seconds.`);
+    } catch (err) {
+      alert('Upload failed.');
+    } finally {
+      setIsUploading(false);
+      e.target.value = '';
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!question.trim()) return;
@@ -120,7 +149,23 @@ export default function Home() {
 
   return (
     <main className="max-w-3xl mx-auto p-8 font-sans">
-      <h1 className="text-3xl font-bold mb-8">Argus Research Agent</h1>
+      <div className="flex items-center justify-between mb-8">
+        <h1 className="text-3xl font-bold">Argus Research Agent</h1>
+
+        {/* The Upload UI goes right here! */}
+        <div>
+          <label className="text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 cursor-pointer px-4 py-2 rounded-md transition-colors inline-block">
+            {isUploading ? 'Uploading...' : 'Upload PDF/TXT to your Local Knowledge'}
+            <input
+              type="file"
+              accept=".pdf,.txt"
+              onChange={handleFileUpload}
+              className="hidden"
+              disabled={isUploading}
+            />
+          </label>
+        </div>
+      </div>
 
       <form onSubmit={handleSubmit} className="flex gap-4 mb-8">
         <input

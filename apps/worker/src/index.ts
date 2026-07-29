@@ -1,6 +1,6 @@
 // apps/worker/src/index.ts
 import { httpServer, io } from './socket';
-import { researchWorker } from './queues';
+import { ingestWorker, researchWorker } from './queues';
 
 io.on('connection', (socket) => {
     console.log(`[Socket] Frontend UI connected: ${socket.id}`);
@@ -21,6 +21,7 @@ httpServer.listen(PORT, () => {
 process.on('SIGTERM', async () => {
     console.log('SIGTERM received. Cleaning up worker and sockets...');
     await researchWorker.close();
+    await ingestWorker.close();
     httpServer.close();
     process.exit(0);
 });

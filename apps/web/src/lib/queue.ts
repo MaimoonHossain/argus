@@ -10,3 +10,6 @@ const connection = new IORedis(redisUrl, {
 });
 
 export const researchQueue = new Queue('research-pipeline', { connection });
+
+// NEW: Add the ingest queue sharing the same Redis connection
+export const ingestQueue = new Queue('ingest-pipeline', { connection });
