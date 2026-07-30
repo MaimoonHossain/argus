@@ -67,6 +67,25 @@ export const knowledgeChunks = pgTable(
   }),
 );
 
+export const semanticCache = pgTable(
+  "semantic_cache",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    question: text("question").notNull(),
+    // Matches the 768 dimensions of Gemini embeddings
+    questionEmbedding: vector("question_embedding", { dimensions: 768 }).notNull(),
+    answer: text("answer").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => ({
+    // HNSW index for ultra-fast vector similarity search
+    semanticCacheEmbeddingIdx: index("semantic_cache_embedding_idx").using(
+      "hnsw",
+      t.questionEmbedding.op("vector_cosine_ops"),
+    ),
+  })
+);
+
 export const subQuestions = pgTable(
   "sub_questions",
   {

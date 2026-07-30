@@ -1,6 +1,6 @@
 // apps/worker/src/pipeline/researcher.ts
 import { StateGraph, START, END, Annotation, MemorySaver } from '@langchain/langgraph';
-import { db, researchJobs, knowledgeChunks } from '@argus/db';
+import { db, researchJobs, knowledgeChunks, semanticCache } from '@argus/db';
 import { eq, or, sql } from 'drizzle-orm';
 import { embedQuestion } from '../llm/gemini';
 import { GoogleGenAI } from '@google/genai';
@@ -28,6 +28,7 @@ const AgentState = Annotation.Root({
         default: () => []
     }),
 
+    isCacheHit: Annotation<boolean>({ reducer: (state, update) => update ?? state, default: () => false }),
     localContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     webContext: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
     finalAnswer: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "" }),
@@ -38,6 +39,65 @@ const AgentState = Annotation.Root({
     routeDecision: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "both" }),
 });
 
+function routeAfterCache(state: typeof AgentState.State) {
+    if (state.isCacheHit) {
+        console.log("[Graph] Cache hit! Skipping research workflow.");
+        return 'end'; // Jumps to END
+    }
+    console.log("[Graph] Cache miss. Proceeding to router.");
+    return 'router'; // Continues standard workflow
+}
+
+async function checkCache(state: typeof AgentState.State) {
+    console.log(`[Node] Checking Semantic Cache for: "${state.question}"`);
+
+    const embedding = await embedQuestion(state.question);
+
+    // We fetch the absolute closest matching question in the DB, regardless of strict bounds
+    const results = await db.select({
+        question: semanticCache.question,
+        answer: semanticCache.answer,
+        distance: sql<number>`${semanticCache.questionEmbedding} <=> ${JSON.stringify(embedding)}`
+    })
+        .from(semanticCache)
+        .orderBy(sql`${semanticCache.questionEmbedding} <=> ${JSON.stringify(embedding)}`)
+        .limit(1);
+
+    if (results.length > 0) {
+        const distance = Number(results[0].distance);
+        console.log(`[Cache] Closest past question: "${results[0].question}"`);
+        console.log(`[Cache] Vector Distance: ${distance.toFixed(4)}`);
+
+        // Relaxed threshold: 0.15 allows for semantic phrasing variations (~85% similarity)
+        const similarityThreshold = 0.15;
+
+        if (distance < similarityThreshold) {
+            console.log(`[Cache] 🎯 HIT! Distance is below threshold. Skipping LLM.`);
+
+            // Instantly update the UI status and provide the cached answer!
+            await db.update(researchJobs)
+                .set({ status: 'complete', finalAnswer: results[0].answer })
+                .where(eq(researchJobs.id, state.jobId));
+
+            io.emit('job-update', {
+                id: state.jobId,
+                status: 'complete',
+                finalAnswer: results[0].answer
+            });
+
+            return {
+                isCacheHit: true,
+                finalAnswer: results[0].answer
+            };
+        } else {
+            console.log(`[Cache] MISS. Match was not close enough (needed < ${similarityThreshold}).`);
+        }
+    } else {
+        console.log(`[Cache] MISS. Cache is empty.`);
+    }
+
+    return { isCacheHit: false };
+}
 // 2. NEW NODE: The Router + Query Rewriter
 async function router(state: typeof AgentState.State) {
     console.log(`[Node] Routing & Contextualizing question: "${state.question}"`);
@@ -125,9 +185,9 @@ async function router(state: typeof AgentState.State) {
         };
     } catch (err) {
         console.error("[Router] JSON Parse failed, falling back", err);
-        return { 
+        return {
             question: state.question,
-            routeDecision: forcedRoute || "local" 
+            routeDecision: forcedRoute || "local"
         };
     }
 }
@@ -211,6 +271,23 @@ async function synthesize(state: typeof AgentState.State) {
     await db.update(researchJobs).set({ status: 'complete', finalAnswer }).where(eq(researchJobs.id, state.jobId));
     io.emit('job-update', { id: state.jobId, status: 'complete', finalAnswer });
 
+    // --- NEW: WRITE TO SEMANTIC CACHE ---
+    try {
+        console.log(`[Cache] Saving new answer to Semantic Cache...`);
+        // We embed the original question to save alongside the answer
+        const questionEmbedding = await embedQuestion(state.question);
+
+        await db.insert(semanticCache).values({
+            question: state.question,
+            questionEmbedding: questionEmbedding,
+            answer: finalAnswer,
+        });
+        console.log(`[Cache] ✅ Successfully saved to cache.`);
+    } catch (err) {
+        console.error(`[Cache] ❌ Failed to save to cache`, err);
+    }
+    // ------------------------------------
+
     // Append the AI's response to the messages array
     return {
         finalAnswer,
@@ -218,37 +295,52 @@ async function synthesize(state: typeof AgentState.State) {
     };
 }
 
+function routeDecision(state: typeof AgentState.State) {
+    if (state.routeDecision === 'local') return 'local';
+    if (state.routeDecision === 'web') return 'web';
+    if (state.routeDecision === 'both') return 'both'; // if you have a parallel both route
+    return 'synthesize'; // direct route fallback
+}
+
 // Initialize the checkpointer
 const checkpointer = new MemorySaver();
 
 // 6. Compile the Agentic Graph
 const workflow = new StateGraph(AgentState)
+    .addNode('checkCache', checkCache)
     .addNode("router", router)
     .addNode("retrieveLocal", retrieveLocal)
     .addNode("searchLiveWeb", searchLiveWeb)
     .addNode("synthesize", synthesize)
 
-    // Start at the router
-    .addEdge(START, "router")
+    // 1. Graph execution now starts at the Cache Check
+    .addEdge(START, "checkCache")
 
-    // Conditional Edge: Where does the router send us?
-    .addConditionalEdges("router", (state) => {
-        if (state.routeDecision === "local" || state.routeDecision === "both") return "retrieveLocal";
-        if (state.routeDecision === "web") return "searchLiveWeb";
-        return "synthesize"; // "direct" route
+    // 2. If Cache Hits -> END. If Miss -> router.
+    .addConditionalEdges("checkCache", routeAfterCache)
+
+    // 3. Conditional Edge: Where does the router send us?
+    // Map the string returns from your function to the actual Node names!
+    .addConditionalEdges("router", routeDecision, {
+        local: "retrieveLocal",
+        web: "searchLiveWeb",
+        both: "retrieveLocal", // Sends 'both' to local first (preserves your sequential logic)
+        synthesize: "synthesize"
     })
 
-    // Conditional Edge: If we went local, do we also need web?
+    // 4. Conditional Edge: If we went local, do we also need web?
     .addConditionalEdges("retrieveLocal", (state) => {
         if (state.routeDecision === "both") return "searchLiveWeb";
         return "synthesize";
     })
 
-    // If we hit the web, always synthesize next
+    // 5. If we hit the web, always synthesize next
     .addEdge("searchLiveWeb", "synthesize")
+
+    // 6. Finish graph after synthesis
     .addEdge("synthesize", END);
 
-const app = workflow.compile({ checkpointer });
+export const app = workflow.compile({ checkpointer });
 
 // 7. BullMQ Entrypoint
 export async function processResearchJob(job: Job) {
