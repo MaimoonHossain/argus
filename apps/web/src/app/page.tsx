@@ -3,6 +3,7 @@
 
 import { useState, useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { MessageRenderer } from '@/components/MessageRenderer';
 
 type JobResult = {
   id: string;
@@ -231,8 +232,8 @@ export default function Home() {
 
           {/* Change this condition to render whenever finalAnswer has content */}
           {job.finalAnswer && (
-            <div className="prose max-w-none whitespace-pre-wrap mt-4 bg-white p-6 border border-gray-100 rounded-md shadow-sm">
-              {job.finalAnswer}
+            <div className="prose max-w-none mt-4 bg-white p-6 border border-gray-100 rounded-md shadow-sm">
+              <MessageRenderer content={job.finalAnswer} />
             </div>
           )}
         </div>

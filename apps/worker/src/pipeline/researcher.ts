@@ -257,15 +257,25 @@ async function synthesize(state: typeof AgentState.State) {
         .map(m => `${m instanceof HumanMessage ? 'User' : 'Assistant'}: ${m.content}`)
         .join('\n');
 
-    const prompt = `You are an expert research assistant. Answer the user's current question using the context below.
+    const prompt = `You are Argus, an expert AI research agent.
 
-    PAST CONVERSATION (for context):
-    ${historyText || "No previous conversation."}
+CRITICAL RULE FOR COMPARISONS:
+Whenever the user asks to compare two or more items, technologies, or concepts, DO NOT use standard Markdown tables. 
+Instead, wrap the comparison inside a custom <compare_matrix> XML tag containing a valid JSON array of objects.
 
-    LOCAL CONTEXT: ${state.localContext}
-    WEB CONTEXT: ${state.webContext}
-    
-    CURRENT QUESTION: ${state.question}`;
+Example Output Format:
+<compare_matrix>
+[
+  { "Feature": "Routing Model", "App Router": "File-system based (app/)", "Pages Router": "File-system based (pages/)" },
+  { "Feature": "Default Rendering", "App Router": "Server Components", "Pages Router": "Client Components" }
+]
+</compare_matrix>
+
+USER QUESTION: ${state.question}
+CONTEXT:
+${state.webContext || state.localContext || 'No additional context needed.'}
+
+Synthesize a helpful answer. Write regular text before or after the <compare_matrix> block.`;
 
     const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3-flash-preview',
