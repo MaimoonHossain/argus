@@ -37,6 +37,14 @@ const AgentState = Annotation.Root({
         default: () => []
     }),
     routeDecision: Annotation<string>({ reducer: (state, update) => update ?? state, default: () => "both" }),
+    searchCount: Annotation<number>({
+        reducer: (x: number, y: number) => y ?? x ?? 0,
+        default: () => 0
+    }),
+    isContextSufficient: Annotation<boolean>({
+        reducer: (x: boolean, y: boolean) => y ?? x ?? false,
+        default: () => false
+    })
 });
 
 function routeAfterCache(state: typeof AgentState.State) {
@@ -302,6 +310,70 @@ async function synthesize(state: typeof AgentState.State) {
     };
 }
 
+async function evaluateContext(state: typeof AgentState.State) {
+    console.log(`[Node] Evaluating retrieved context...`);
+
+    // Fail-safe to prevent infinite loops (Max 2 searches)
+    if (state.searchCount >= 1) {
+        console.log(`[Evaluate] Max retries reached. Forcing synthesis.`);
+        return { isContextSufficient: true, searchCount: state.searchCount + 1 };
+    }
+
+    const prompt = `You are a strict grading assistant. Your job is to check if the provided context contains the answer to the user's question.
+    
+    USER QUESTION: ${state.question}
+    LOCAL CONTEXT: ${state.localContext || 'None'}
+    WEB CONTEXT: ${state.webContext || 'None'}
+
+    If the context contains enough factual information to write a complete answer, output EXACTLY the word: YES
+    If the context is irrelevant, empty, or missing key facts, output EXACTLY the word: NO`;
+
+    const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+    });
+
+    const answer = (response.text || '').trim().toUpperCase();
+    const isSufficient = answer.includes('YES');
+
+    console.log(`[Evaluate] Context sufficient? ${isSufficient ? '✅ YES' : '❌ NO'}`);
+
+    return {
+        isContextSufficient: isSufficient,
+        searchCount: (state.searchCount || 0) + 1
+    };
+}
+
+async function rewriteQuery(state: typeof AgentState.State) {
+    console.log(`[Node] Context failed. Rewriting search query...`);
+
+    const prompt = `The previous search results did not contain the answer. 
+    ORIGINAL QUESTION: ${state.question}
+    
+    Generate a new, broader, or alternative search query to find the correct information.
+    Output ONLY the new search query string, nothing else.`;
+
+    const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt,
+    });
+
+    const newQuery = (response.text || '').trim();
+    console.log(`[Rewrite] Old Query: ${state.question}`);
+    console.log(`[Rewrite] New Query: ${newQuery}`);
+
+    // Update the UI so the user knows Argus is trying harder
+    io.emit('job-update', {
+        id: state.jobId,
+        status: 'researching',
+        chunk: `\n\n*Initial search failed. Expanding search to: "${newQuery}"...*\n\n`
+    });
+
+    return {
+        question: newQuery, // Overwrite the state question so the router uses the new one
+    };
+}
+
 function routeDecision(state: typeof AgentState.State) {
     if (state.routeDecision === 'local') return 'local';
     if (state.routeDecision === 'web') return 'web';
@@ -318,6 +390,8 @@ const workflow = new StateGraph(AgentState)
     .addNode("router", router)
     .addNode("retrieveLocal", retrieveLocal)
     .addNode("searchLiveWeb", searchLiveWeb)
+    .addNode("evaluateContext", evaluateContext)
+    .addNode("rewriteQuery", rewriteQuery)
     .addNode("synthesize", synthesize)
 
     // 1. Graph execution now starts at the Cache Check
@@ -331,20 +405,32 @@ const workflow = new StateGraph(AgentState)
     .addConditionalEdges("router", routeDecision, {
         local: "retrieveLocal",
         web: "searchLiveWeb",
-        both: "retrieveLocal", // Sends 'both' to local first (preserves your sequential logic)
+        both: "retrieveLocal",
         synthesize: "synthesize"
     })
 
     // 4. Conditional Edge: If we went local, do we also need web?
     .addConditionalEdges("retrieveLocal", (state) => {
         if (state.routeDecision === "both") return "searchLiveWeb";
-        return "synthesize";
+        return "evaluateContext";
     })
 
     // 5. If we hit the web, always synthesize next
-    .addEdge("searchLiveWeb", "synthesize")
+    .addEdge("searchLiveWeb", "evaluateContext")
 
-    // 6. Finish graph after synthesis
+    // NEW: The Evaluation Logic Edge
+    .addConditionalEdges("evaluateContext", (state) => {
+        if (state.isContextSufficient) {
+            console.log("[Graph] Context is good. Proceeding to Synthesize.");
+            return "synthesize";
+        }
+        console.log("[Graph] Context is bad. Proceeding to Rewrite.");
+        return "rewriteQuery";
+    })
+
+    // NEW: The Loop
+    .addEdge("rewriteQuery", "router") // Jump back to the router with the new query!
+
     .addEdge("synthesize", END);
 
 export const app = workflow.compile({ checkpointer });
@@ -372,3 +458,4 @@ export async function processResearchJob(job: Job) {
         throw error;
     }
 }
+
