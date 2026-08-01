@@ -34,7 +34,8 @@ export async function POST(req: NextRequest) {
         // 2. Queue a new job if no cache hit
         const [newJob] = await db.insert(researchJobs).values({
             question,
-            status: 'pending'
+            status: 'pending',
+            sessionId: sessionId || 'default-session'
         }).returning({ id: researchJobs.id });
 
         await researchQueue.add('research', { jobId: newJob.id, threadId: sessionId || 'default-session' });

@@ -60,6 +60,12 @@ async function checkCache(state: typeof AgentState.State) {
         distance: sql<number>`${semanticCache.questionEmbedding} <=> ${JSON.stringify(embedding)}`
     })
         .from(semanticCache)
+        .where(
+            or(
+                eq(semanticCache.sessionId, state.sessionId),
+                eq(semanticCache.sessionId, 'global')
+            )
+        )
         .orderBy(sql`${semanticCache.questionEmbedding} <=> ${JSON.stringify(embedding)}`)
         .limit(1);
 
@@ -69,7 +75,7 @@ async function checkCache(state: typeof AgentState.State) {
         console.log(`[Cache] Vector Distance: ${distance.toFixed(4)}`);
 
         // Relaxed threshold: 0.15 allows for semantic phrasing variations (~85% similarity)
-        const similarityThreshold = 0.15;
+        const similarityThreshold = 0.25;
 
         if (distance < similarityThreshold) {
             console.log(`[Cache] 🎯 HIT! Distance is below threshold. Skipping LLM.`);
@@ -278,6 +284,7 @@ async function synthesize(state: typeof AgentState.State) {
         const questionEmbedding = await embedQuestion(state.question);
 
         await db.insert(semanticCache).values({
+            sessionId: state.sessionId,
             question: state.question,
             questionEmbedding: questionEmbedding,
             answer: finalAnswer,

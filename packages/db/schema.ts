@@ -71,6 +71,7 @@ export const semanticCache = pgTable(
   "semantic_cache",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    sessionId: text("session_id").notNull(), // <-- NEW: Isolate by user session
     question: text("question").notNull(),
     // Matches the 768 dimensions of Gemini embeddings
     questionEmbedding: vector("question_embedding", { dimensions: 768 }).notNull(),
