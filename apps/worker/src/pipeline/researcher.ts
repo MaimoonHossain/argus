@@ -219,9 +219,11 @@ async function retrieveLocal(state: typeof AgentState.State) {
             )
         )
         .orderBy(sql`${knowledgeChunks.embedding} <=> ${JSON.stringify(embedding)}`)
-        .limit(3);
+        .limit(10); // <-- UPDATED FROM 3 TO 10
 
-    const context = results.map(r => r.content).join('\n\n');
+    console.log(`[Retrieval] Successfully pulled ${results.length} chunks from the vector database.`);
+
+    const context = results.map(r => r.content).join('\n\n---\n\n');
     return { localContext: context };
 }
 
@@ -260,22 +262,22 @@ async function synthesize(state: typeof AgentState.State) {
     const prompt = `You are Argus, an expert AI research agent.
 
 CRITICAL RULE FOR COMPARISONS:
-Whenever the user asks to compare two or more items, technologies, or concepts, DO NOT use standard Markdown tables. 
-Instead, wrap the comparison inside a custom <compare_matrix> XML tag containing a valid JSON array of objects.
+        Whenever the user asks to compare two or more items, technologies, or concepts, DO NOT use standard Markdown tables.
+        Instead, wrap the comparison inside a custom < compare_matrix > XML tag containing a valid JSON array of objects.
 
 Example Output Format:
-<compare_matrix>
-[
-  { "Feature": "Routing Model", "App Router": "File-system based (app/)", "Pages Router": "File-system based (pages/)" },
-  { "Feature": "Default Rendering", "App Router": "Server Components", "Pages Router": "Client Components" }
-]
-</compare_matrix>
+        <compare_matrix>
+        [
+            { "Feature": "Routing Model", "App Router": "File-system based (app/)", "Pages Router": "File-system based (pages/)" },
+            { "Feature": "Default Rendering", "App Router": "Server Components", "Pages Router": "Client Components" }
+        ]
+        </compare_matrix>
 
 USER QUESTION: ${state.question}
 CONTEXT:
-${state.webContext || state.localContext || 'No additional context needed.'}
+        ${state.webContext || state.localContext || 'No additional context needed.'}
 
-Synthesize a helpful answer. Write regular text before or after the <compare_matrix> block.`;
+Synthesize a helpful answer.Write regular text before or after the < compare_matrix > block.`;
 
     const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3-flash-preview',
@@ -325,11 +327,11 @@ async function evaluateContext(state: typeof AgentState.State) {
 
     // Fail-safe to prevent infinite loops (Max 2 searches)
     if (state.searchCount >= 1) {
-        console.log(`[Evaluate] Max retries reached. Forcing synthesis.`);
+        console.log(`[Evaluate] Max retries reached.Forcing synthesis.`);
         return { isContextSufficient: true, searchCount: state.searchCount + 1 };
     }
 
-    const prompt = `You are a strict grading assistant. Your job is to check if the provided context contains the answer to the user's question.
+    const prompt = `You are a strict grading assistant.Your job is to check if the provided context contains the answer to the user's question.
     
     USER QUESTION: ${state.question}
     LOCAL CONTEXT: ${state.localContext || 'None'}
@@ -346,7 +348,7 @@ async function evaluateContext(state: typeof AgentState.State) {
     const answer = (response.text || '').trim().toUpperCase();
     const isSufficient = answer.includes('YES');
 
-    console.log(`[Evaluate] Context sufficient? ${isSufficient ? '✅ YES' : '❌ NO'}`);
+    console.log(`[Evaluate] Context sufficient ? ${isSufficient ? '✅ YES' : '❌ NO'} `);
 
     return {
         isContextSufficient: isSufficient,
@@ -355,7 +357,7 @@ async function evaluateContext(state: typeof AgentState.State) {
 }
 
 async function rewriteQuery(state: typeof AgentState.State) {
-    console.log(`[Node] Context failed. Rewriting search query...`);
+    console.log(`[Node] Context failed.Rewriting search query...`);
 
     const prompt = `The previous search results did not contain the answer. 
     ORIGINAL QUESTION: ${state.question}
@@ -369,14 +371,14 @@ async function rewriteQuery(state: typeof AgentState.State) {
     });
 
     const newQuery = (response.text || '').trim();
-    console.log(`[Rewrite] Old Query: ${state.question}`);
-    console.log(`[Rewrite] New Query: ${newQuery}`);
+    console.log(`[Rewrite] Old Query: ${state.question} `);
+    console.log(`[Rewrite] New Query: ${newQuery} `);
 
     // Update the UI so the user knows Argus is trying harder
     io.emit('job-update', {
         id: state.jobId,
         status: 'researching',
-        chunk: `\n\n*Initial search failed. Expanding search to: "${newQuery}"...*\n\n`
+        chunk: `\n\n * Initial search failed.Expanding search to: "${newQuery}"...*\n\n`
     });
 
     return {
@@ -462,7 +464,7 @@ export async function processResearchJob(job: Job) {
             messages: [new HumanMessage(jobRecord.question)]
         }, config);
     } catch (error: any) {
-        console.error(`[Worker Error] Job ${jobId} failed:`, error);
+        console.error(`[Worker Error] Job ${jobId} failed: `, error);
         await db.update(researchJobs).set({ status: 'failed', errorMessage: error.message }).where(eq(researchJobs.id, jobId));
         io.emit('job-update', { id: jobId, status: 'failed', errorMessage: error.message });
         throw error;
