@@ -13,6 +13,7 @@ export function MessageRenderer({ content }: { content: string }) {
   }
 
   const jsonPayload = match[1];
+  const hasCloseTag = content.includes('</compare_matrix>');
   const [beforeTag, afterTagWithClose] = content.split('<compare_matrix>');
   const afterTag = afterTagWithClose?.includes('</compare_matrix>')
     ? afterTagWithClose.split('</compare_matrix>')[1]
@@ -21,7 +22,7 @@ export function MessageRenderer({ content }: { content: string }) {
   return (
     <div className="space-y-4">
       {beforeTag && <ReactMarkdown>{beforeTag}</ReactMarkdown>}
-      <ComparisonTable jsonPayload={jsonPayload} />
+      <ComparisonTable jsonPayload={jsonPayload} isClosed={hasCloseTag} />
       {afterTag && <ReactMarkdown>{afterTag}</ReactMarkdown>}
     </div>
   );

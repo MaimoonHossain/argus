@@ -1,4 +1,5 @@
 // packages/db/schema.ts
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   pgEnum,
@@ -60,9 +61,16 @@ export const knowledgeChunks = pgTable(
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => ({
+    // Your existing HNSW vector index for semantic search
     knowledgeChunksEmbeddingIdx: index("knowledge_chunks_embedding_idx").using(
       "hnsw",
       t.embedding.op("vector_cosine_ops"),
+    ),
+
+    // NEW: GIN expression index for Full-Text Search keyword matching
+    ftsIdx: index("fts_idx").using(
+      "gin",
+      sql`to_tsvector('english', ${t.content})`
     ),
   }),
 );

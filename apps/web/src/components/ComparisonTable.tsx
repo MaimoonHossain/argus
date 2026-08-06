@@ -4,9 +4,10 @@ import React from 'react';
 
 interface ComparisonTableProps {
   jsonPayload: string;
+  isClosed?: boolean;
 }
 
-export default function ComparisonTable({ jsonPayload }: ComparisonTableProps) {
+export default function ComparisonTable({ jsonPayload, isClosed = false }: ComparisonTableProps) {
   try {
     // Strip out any accidental markdown code wrappers
     const cleanedJson = jsonPayload.replace(/```json|```/g, '').trim();
@@ -43,6 +44,9 @@ export default function ComparisonTable({ jsonPayload }: ComparisonTableProps) {
       </div>
     );
   } catch (error) {
+    // If the tag has already been closed and parsing failed, do not display the loader
+    if (isClosed) return null;
+
     // Render a streaming loader while the JSON is actively streaming from the LLM
     return (
       <div className="my-6 p-4 rounded-lg border border-blue-100 bg-blue-50/50 flex items-center gap-3 text-blue-700 animate-pulse text-sm font-medium">
