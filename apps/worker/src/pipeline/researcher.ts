@@ -8,9 +8,113 @@ import { tavily } from '@tavily/core';
 import { Job } from 'bullmq';
 import { io } from '../socket';
 import { AIMessage, BaseMessage, HumanMessage } from '@langchain/core/messages';
+import { traceable } from 'langsmith/traceable';
 
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY! });
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+// --- LangSmith Traced Operations & Resilience ---
+async function retryOnTransientError<T>(
+    operation: () => Promise<T>,
+    maxRetries = 2,
+    baseDelayMs = 1500
+): Promise<T> {
+    let lastError: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (err: any) {
+            lastError = err;
+            const errMsg = String(err?.message || err).toLowerCase();
+            const isTransient =
+                errMsg.includes('503') ||
+                errMsg.includes('unavailable') ||
+                errMsg.includes('high demand') ||
+                errMsg.includes('rate limit') ||
+                errMsg.includes('429') ||
+                errMsg.includes('econnreset') ||
+                errMsg.includes('fetch failed');
+
+            if (!isTransient || attempt === maxRetries) {
+                throw err;
+            }
+
+            const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 500;
+            console.warn(`[Gemini Retry] Attempt ${attempt + 1} hit transient issue. Retrying in ${Math.round(delay)}ms...`);
+            await new Promise(res => setTimeout(res, delay));
+        }
+    }
+    throw lastError;
+}
+
+const traceRouterLLM = traceable(
+    async (prompt: string) => {
+        return await retryOnTransientError(async () => {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: prompt,
+                config: {
+                    temperature: 0,
+                    responseMimeType: "application/json"
+                }
+            });
+            return response.text || "{}";
+        });
+    },
+    { name: "Gemini Router & Query Rewriter", run_type: "llm" }
+);
+
+const traceHybridSearch = traceable(
+    async (querySql: any) => {
+        return await db.execute(querySql);
+    },
+    { name: "Neon Hybrid Search (Vector + FTS)", run_type: "retriever" }
+);
+
+const traceTavilySearch = traceable(
+    async (query: string) => {
+        return await tvly.search(query, { searchDepth: "basic", maxResults: 3 });
+    },
+    { name: "Tavily Web Search", run_type: "tool" }
+);
+
+const traceSynthesizeStream = traceable(
+    async (prompt: string) => {
+        return await retryOnTransientError(async () => {
+            return await ai.models.generateContentStream({
+                model: 'gemini-3-flash-preview',
+                contents: prompt,
+            });
+        });
+    },
+    { name: "Gemini Synthesizer Stream", run_type: "llm" }
+);
+
+const traceEvaluateContextLLM = traceable(
+    async (prompt: string) => {
+        return await retryOnTransientError(async () => {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: prompt,
+            });
+            return response.text || "";
+        });
+    },
+    { name: "Gemini Evaluate Context", run_type: "llm" }
+);
+
+const traceRewriteQueryLLM = traceable(
+    async (prompt: string) => {
+        return await retryOnTransientError(async () => {
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-flash-preview',
+                contents: prompt,
+            });
+            return response.text || "";
+        });
+    },
+    { name: "Gemini Rewrite Query", run_type: "llm" }
+);
 
 // 1. Add routeDecision to States
 const AgentState = Annotation.Root({
@@ -175,17 +279,10 @@ async function router(state: typeof AgentState.State) {
         "routeDecision": "both" | "local" | "web" | "direct"
     }`;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-        config: {
-            temperature: 0,
-            responseMimeType: "application/json" // Force strict JSON output
-        }
-    });
+    const responseText = await traceRouterLLM(prompt);
 
     try {
-        const result = JSON.parse(response.text || "{}");
+        const result = JSON.parse(responseText || "{}");
         const decision = forcedRoute || result.routeDecision || "local";
         const rewrittenQuestion = result.rewrittenQuestion || state.question;
 
@@ -255,7 +352,7 @@ async function retrieveLocal(state: typeof AgentState.State) {
     `;
 
     // Execute the raw query
-    const result = await db.execute(query);
+    const result = await traceHybridSearch(query);
 
     // Depending on your Neon driver setup, result might be an array or an object containing .rows
     const rows = Array.isArray(result) ? result : result.rows;
@@ -274,7 +371,7 @@ async function retrieveLocal(state: typeof AgentState.State) {
 async function searchLiveWeb(state: typeof AgentState.State) {
     console.log(`[Node] Executing Live Web Search...`);
     try {
-        const response = await tvly.search(state.question, { searchDepth: "basic", maxResults: 3 });
+        const response = await traceTavilySearch(state.question);
         const webInfo = response.results.map((r: any) => `Source: ${r.title}\n${r.content}`).join('\n\n');
 
         const webSources = response.results.map((r: any) => ({
@@ -332,10 +429,7 @@ CONTEXT:
 
 Synthesize a helpful, concise answer to the USER QUESTION using clear Markdown formatting.`;
 
-    const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-    });
+    const responseStream = await traceSynthesizeStream(prompt);
 
     let fullAnswer = "";
     for await (const chunk of responseStream) {
@@ -393,12 +487,9 @@ async function evaluateContext(state: typeof AgentState.State) {
     If the context contains enough factual information to write a complete answer, output EXACTLY the word: YES
     If the context is irrelevant, empty, or missing key facts, output EXACTLY the word: NO`;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-    });
+    const responseText = await traceEvaluateContextLLM(prompt);
 
-    const answer = (response.text || '').trim().toUpperCase();
+    const answer = (responseText || '').trim().toUpperCase();
     const isSufficient = answer.includes('YES');
 
     console.log(`[Evaluate] Context sufficient ? ${isSufficient ? '✅ YES' : '❌ NO'} `);
@@ -418,12 +509,9 @@ async function rewriteQuery(state: typeof AgentState.State) {
     Generate a new, broader, or alternative search query to find the correct information.
     Output ONLY the new search query string, nothing else.`;
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-    });
+    const responseText = await traceRewriteQueryLLM(prompt);
 
-    const newQuery = (response.text || '').trim();
+    const newQuery = (responseText || '').trim();
     console.log(`[Rewrite] Old Query: ${state.question} `);
     console.log(`[Rewrite] New Query: ${newQuery} `);
 
@@ -507,7 +595,15 @@ export async function processResearchJob(job: Job) {
     if (!jobRecord) throw new Error("Job not found");
 
     // We use a hardcoded thread string if one isn't provided yet
-    const config = { configurable: { thread_id: threadId || "default-session" } };
+    const config = {
+        configurable: { thread_id: threadId || "default-session" },
+        tags: ["argus-research", `session:${threadId || "default-session"}`],
+        metadata: {
+            jobId: jobRecord.id,
+            sessionId: threadId || "default-session",
+            question: jobRecord.question
+        }
+    };
 
     try {
         await app.invoke({

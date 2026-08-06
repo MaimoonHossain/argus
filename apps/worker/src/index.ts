@@ -1,4 +1,9 @@
 // apps/worker/src/index.ts
+import dotenv from 'dotenv';
+import path from 'path';
+
+dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
 import { httpServer, io } from './socket';
 import { ingestWorker, researchWorker } from './queues';
 
