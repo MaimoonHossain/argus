@@ -352,7 +352,7 @@ async function retrieveLocal(state: typeof AgentState.State) {
     `;
 
     // Execute the raw query
-    const result = await traceHybridSearch(query);
+    const result = await traceHybridSearch(query as any);
 
     // Depending on your Neon driver setup, result might be an array or an object containing .rows
     const rows = Array.isArray(result) ? result : result.rows;
