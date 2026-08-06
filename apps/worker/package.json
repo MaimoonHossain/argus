@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "tsx --env-file=../../.env watch src/index.ts",
+    "build": "tsc",
     "start": "node dist/index.js",
     "seed": "tsx --env-file=../../.env src/seed.ts"
   },
