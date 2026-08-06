@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "tsx --env-file=../../.env watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "build": "tsc --noEmit",
+    "start": "tsx src/index.ts",
     "seed": "tsx --env-file=../../.env src/seed.ts"
   },
   "dependencies": {
@@ -19,11 +19,11 @@
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
     "langsmith": "^0.8.9",
-    "socket.io": "^4.8.3"
+    "socket.io": "^4.8.3",
+    "tsx": "^4.16.2"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
-    "tsx": "^4.16.2",
     "typescript": "^5.5.3"
   }
 }
