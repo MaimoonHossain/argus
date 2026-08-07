@@ -4,12 +4,22 @@ import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import ComparisonTable from './ComparisonTable';
 
-export function MessageRenderer({ content }: { content: string }) {
+interface MessageRendererProps {
+  content: string;
+}
+
+export function MessageRenderer({ content }: MessageRendererProps) {
+  if (!content) return null;
+
   // Check if the stream contains <compare_matrix> tag (closing tag optional for live streaming)
   const match = content.match(/<compare_matrix>([\s\S]*?)(?:<\/compare_matrix>|$)/);
 
   if (!match) {
-    return <ReactMarkdown>{content}</ReactMarkdown>;
+    return (
+      <div className="prose-argus">
+        <ReactMarkdown>{content}</ReactMarkdown>
+      </div>
+    );
   }
 
   const jsonPayload = match[1];
@@ -21,9 +31,19 @@ export function MessageRenderer({ content }: { content: string }) {
 
   return (
     <div className="space-y-4">
-      {beforeTag && <ReactMarkdown>{beforeTag}</ReactMarkdown>}
+      {beforeTag && (
+        <div className="prose-argus">
+          <ReactMarkdown>{beforeTag}</ReactMarkdown>
+        </div>
+      )}
+      
       <ComparisonTable jsonPayload={jsonPayload} isClosed={hasCloseTag} />
-      {afterTag && <ReactMarkdown>{afterTag}</ReactMarkdown>}
+
+      {afterTag && (
+        <div className="prose-argus">
+          <ReactMarkdown>{afterTag}</ReactMarkdown>
+        </div>
+      )}
     </div>
   );
 }
